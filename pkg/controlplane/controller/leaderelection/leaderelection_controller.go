@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 )
 
@@ -68,6 +69,8 @@ type Controller struct {
 	leaseCandidateRegistration cache.ResourceEventHandlerRegistration
 
 	queue workqueue.TypedRateLimitingInterface[types.NamespacedName]
+
+	clock clock.Clock
 }
 
 func (c *Controller) Run(ctx context.Context, workers int) {
@@ -114,6 +117,8 @@ func NewController(leaseInformer coordinationv1informers.LeaseInformer, leaseCan
 		leaseCandidateClient:   leaseCandidateClient,
 
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](), workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{Name: controllerName}),
+
+		clock: clock.RealClock{},
 	}
 	leaseSynced, err := leaseInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -199,13 +204,13 @@ func (c *Controller) electionNeeded(candidates []*v1alpha1.LeaseCandidate, lease
 		return true, nil
 	}
 
-	if isLeaseExpired(lease) || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
+	if isLeaseExpired(c.clock, lease) || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
 		return true, nil
 	}
 
 	// every 15min enforce an election to update all candidates. Every 30min we garbage collect.
 	for _, candidate := range candidates {
-		if candidate.Spec.RenewTime != nil && candidate.Spec.RenewTime.Add(leaseCandidateValidDuration/2).Before(time.Now()) {
+		if candidate.Spec.RenewTime != nil && candidate.Spec.RenewTime.Add(leaseCandidateValidDuration/2).Before(c.clock.Now()) {
 			return true, nil
 		}
 	}
@@ -240,7 +245,6 @@ func (c *Controller) electionNeeded(candidates []*v1alpha1.LeaseCandidate, lease
 // PingTime + electionDuration < time.Now: Candidate has not responded within the appropriate PingTime. Continue the election.
 // RenewTime + 5 seconds > time.Now: All candidates acked in the last 5 seconds, continue the election.
 func (c *Controller) reconcileElectionStep(ctx context.Context, leaseNN types.NamespacedName) (requeue time.Duration, err error) {
-
 	candidates, err := c.listAdmissableCandidates(leaseNN)
 	if err != nil {
 		return defaultRequeueInterval, err
@@ -258,7 +262,7 @@ func (c *Controller) reconcileElectionStep(ctx context.Context, leaseNN types.Na
 		return defaultRequeueInterval, err
 	}
 
-	now := time.Now()
+	now := c.clock.Now()
 	canVoteYet := true
 	for _, candidate := range candidates {
 		if candidate.Spec.PingTime != nil && candidate.Spec.PingTime.Add(electionDuration).After(now) &&
@@ -274,7 +278,8 @@ func (c *Controller) reconcileElectionStep(ctx context.Context, leaseNN types.Na
 
 		if candidate.Spec.PingTime == nil ||
 			// If PingTime is outdated, send another PingTime only if it already acked the first one.
-			(candidate.Spec.PingTime.Add(electionDuration).Before(now) && candidate.Spec.PingTime.Before(candidate.Spec.RenewTime)) {
+			// This checks for pingTime <= renewTime because equality is possible in unit tests using a fake clock.
+			(candidate.Spec.PingTime.Add(electionDuration).Before(now) && !candidate.Spec.RenewTime.Before(candidate.Spec.PingTime)) {
 			// TODO(jefftree): We should randomize the order of sending pings and do them in parallel
 			// so that all candidates have equal opportunity to ack.
 			clone := candidate.DeepCopy()
@@ -296,7 +301,7 @@ func (c *Controller) reconcileElectionStep(ctx context.Context, leaseNN types.Na
 			continue // shouldn't be the case after the above
 		}
 
-		if candidate.Spec.RenewTime != nil && candidate.Spec.PingTime.Before(candidate.Spec.RenewTime) {
+		if candidate.Spec.RenewTime != nil && !candidate.Spec.RenewTime.Before(candidate.Spec.PingTime) {
 			continue // this has renewed already
 		}
 
@@ -331,7 +336,7 @@ func (c *Controller) reconcileElectionStep(ctx context.Context, leaseNN types.Na
 		Spec: v1.LeaseSpec{
 			Strategy:             &strategy,
 			LeaseDurationSeconds: ptr.To(defaultLeaseDurationSeconds),
-			RenewTime:            &metav1.MicroTime{Time: time.Now()},
+			RenewTime:            &metav1.MicroTime{Time: c.clock.Now()},
 		},
 	}
 
@@ -368,7 +373,7 @@ func (c *Controller) reconcileElectionStep(ctx context.Context, leaseNN types.Na
 	}
 	orig := existing.DeepCopy()
 
-	isExpired := isLeaseExpired(existing)
+	isExpired := isLeaseExpired(c.clock, existing)
 	noHolderIdentity := leaderLease.Spec.HolderIdentity != nil && existing.Spec.HolderIdentity == nil || *existing.Spec.HolderIdentity == ""
 	expiredAndNewHolder := isExpired && leaderLease.Spec.HolderIdentity != nil && *existing.Spec.HolderIdentity != *leaderLease.Spec.HolderIdentity
 	strategyChanged := existing.Spec.Strategy == nil || *existing.Spec.Strategy != strategy
@@ -420,7 +425,7 @@ func (c *Controller) listAdmissableCandidates(leaseNN types.NamespacedName) ([]*
 		if l.Spec.LeaseName != leaseNN.Name {
 			continue
 		}
-		if !isLeaseCandidateExpired(l) {
+		if !isLeaseCandidateExpired(c.clock, l) {
 			results = append(results, l)
 		} else {
 			klog.Infof("LeaseCandidate %s is expired", l.Name)
