@@ -46,25 +46,28 @@ type ClaimLister interface {
 // available and the current state of the cluster (claims, classes, resource
 // slices).
 type Allocator struct {
-	claimsToAllocate []*resourceapi.ResourceClaim
-	claimLister      ClaimLister
-	classLister      resourcelisters.DeviceClassLister
-	sliceLister      resourcelisters.ResourceSliceLister
+	adminAccessEnabled bool
+	claimsToAllocate   []*resourceapi.ResourceClaim
+	claimLister        ClaimLister
+	classLister        resourcelisters.DeviceClassLister
+	sliceLister        resourcelisters.ResourceSliceLister
 }
 
 // NewAllocator returns an allocator for a certain set of claims or an error if
 // some problem was detected which makes it impossible to allocate claims.
 func NewAllocator(ctx context.Context,
+	adminAccessEnabled bool,
 	claimsToAllocate []*resourceapi.ResourceClaim,
 	claimLister ClaimLister,
 	classLister resourcelisters.DeviceClassLister,
 	sliceLister resourcelisters.ResourceSliceLister,
 ) (*Allocator, error) {
 	return &Allocator{
-		claimsToAllocate: claimsToAllocate,
-		claimLister:      claimLister,
-		classLister:      classLister,
-		sliceLister:      sliceLister,
+		adminAccessEnabled: adminAccessEnabled,
+		claimsToAllocate:   claimsToAllocate,
+		claimLister:        claimLister,
+		classLister:        classLister,
+		sliceLister:        sliceLister,
 	}, nil
 }
 
@@ -160,6 +163,10 @@ func (a *Allocator) Allocate(ctx context.Context, node *v1.Node) (finalResult []
 				}
 			}
 
+			if !a.adminAccessEnabled && request.AdminAccess != nil {
+				return nil, fmt.Errorf("claim %s, request %s: admin access is requested, but the feature is disabled", klog.KObj(claim), request.Name)
+			}
+
 			// Should be set. If it isn't, something changed and we should refuse to proceed.
 			if request.DeviceClassName == "" {
 				return nil, fmt.Errorf("claim %s, request %s: missing device class name (unsupported request type?)", klog.KObj(claim), request.Name)
@@ -190,6 +197,9 @@ func (a *Allocator) Allocate(ctx context.Context, node *v1.Node) (finalResult []
 				for _, pool := range pools {
 					if pool.IsIncomplete {
 						return nil, fmt.Errorf("claim %s, request %s: asks for all devices, but resource pool %s is currently being updated", klog.KObj(claim), request.Name, pool.PoolID)
+					}
+					if pool.IsInvalid {
+						return nil, fmt.Errorf("claim %s, request %s: asks for all devices, but resource pool %s is currently invalid", klog.KObj(claim), request.Name, pool.PoolID)
 					}
 
 					for _, slice := range pool.Slices {
@@ -273,6 +283,15 @@ func (a *Allocator) Allocate(ctx context.Context, node *v1.Node) (finalResult []
 			continue
 		}
 		for _, result := range claim.Status.Allocation.Devices.Results {
+			// Kubernetes 1.31 did not set this, 1.32 always does.
+			// Supporting 1.31 is not worth the additional code that
+			// would have to be written (= looking up in request) because
+			// it is extremely unlikely that there really is a result
+			// that still exists in a cluster from 1.31 where this matters.
+			if ptr.Deref(result.AdminAccess, false) {
+				// Ignore, it's not considered allocated.
+				continue
+			}
 			deviceID := DeviceID{Driver: result.Driver, Pool: result.Pool, Device: result.Device}
 			alloc.allocated[deviceID] = true
 			numAllocated++
@@ -568,7 +587,7 @@ func (alloc *allocator) allocateOne(r deviceIndices) (bool, error) {
 				deviceID := DeviceID{Driver: pool.Driver, Pool: pool.Pool, Device: slice.Spec.Devices[deviceIndex].Name}
 
 				// Checking for "in use" is cheap and thus gets done first.
-				if !request.AdminAccess && alloc.allocated[deviceID] {
+				if !ptr.Deref(request.AdminAccess, false) && alloc.allocated[deviceID] {
 					alloc.logger.V(7).Info("Device in use", "device", deviceID)
 					continue
 				}
@@ -581,6 +600,13 @@ func (alloc *allocator) allocateOne(r deviceIndices) (bool, error) {
 				if !selectable {
 					alloc.logger.V(7).Info("Device not selectable", "device", deviceID)
 					continue
+				}
+
+				// If the pool is not valid, then fail now. It's okay when pools of one driver
+				// are invalid if we allocate from some other pool, but it's not safe to
+				// allocated from an invalid pool.
+				if pool.IsInvalid {
+					return false, fmt.Errorf("pool %s is invalid: %s", pool.Pool, pool.InvalidReason)
 				}
 
 				// Finally treat as allocated and move on to the next device.
@@ -704,7 +730,7 @@ func (alloc *allocator) selectorsMatch(r requestIndices, device *resourceapi.Bas
 func (alloc *allocator) allocateDevice(r deviceIndices, device *resourceapi.BasicDevice, deviceID DeviceID, must bool) (bool, func(), error) {
 	claim := alloc.claimsToAllocate[r.claimIndex]
 	request := &claim.Spec.Devices.Requests[r.requestIndex]
-	adminAccess := request.AdminAccess
+	adminAccess := ptr.Deref(request.AdminAccess, false)
 	if !adminAccess && alloc.allocated[deviceID] {
 		alloc.logger.V(7).Info("Device in use", "device", deviceID)
 		return false, nil, nil
@@ -739,6 +765,9 @@ func (alloc *allocator) allocateDevice(r deviceIndices, device *resourceapi.Basi
 		Driver:  deviceID.Driver,
 		Pool:    deviceID.Pool,
 		Device:  deviceID.Device,
+	}
+	if adminAccess {
+		result.AdminAccess = &adminAccess
 	}
 	previousNumResults := len(alloc.result[r.claimIndex].Devices.Results)
 	alloc.result[r.claimIndex].Devices.Results = append(alloc.result[r.claimIndex].Devices.Results, result)

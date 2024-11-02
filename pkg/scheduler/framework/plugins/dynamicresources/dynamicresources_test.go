@@ -178,6 +178,19 @@ func reserve(claim *resourceapi.ResourceClaim, pod *v1.Pod) *resourceapi.Resourc
 		Obj()
 }
 
+func adminAccess(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
+	claim = claim.DeepCopy()
+	for i := range claim.Spec.Devices.Requests {
+		claim.Spec.Devices.Requests[i].AdminAccess = ptr.To(true)
+	}
+	if claim.Status.Allocation != nil {
+		for i := range claim.Status.Allocation.Devices.Results {
+			claim.Status.Allocation.Devices.Results[i].AdminAccess = ptr.To(true)
+		}
+	}
+	return claim
+}
+
 func breakCELInClaim(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
 	claim = claim.DeepCopy()
 	for i := range claim.Spec.Devices.Requests {
@@ -556,6 +569,66 @@ func TestPlugin(t *testing.T) {
 			},
 		},
 
+		"request-admin-access": {
+			// Because the pending claim asks for admin access, allocation succeeds despite resources
+			// being exhausted.
+			pod:     podWithClaimName,
+			claims:  []*resourceapi.ResourceClaim{adminAccess(pendingClaim), otherAllocatedClaim},
+			classes: []*resourceapi.DeviceClass{deviceClass},
+			objs:    []apiruntime.Object{workerNodeSlice},
+			want: want{
+				reserve: result{
+					inFlightClaim: adminAccess(allocatedClaim),
+				},
+				prebind: result{
+					assumedClaim: reserve(adminAccess(allocatedClaim), podWithClaimName),
+					changes: change{
+						claim: func(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
+							if claim.Name == claimName {
+								claim = claim.DeepCopy()
+								claim.Finalizers = allocatedClaim.Finalizers
+								claim.Status = adminAccess(inUseClaim).Status
+							}
+							return claim
+						},
+					},
+				},
+				postbind: result{
+					assumedClaim: reserve(adminAccess(allocatedClaim), podWithClaimName),
+				},
+			},
+		},
+
+		"structured-ignore-allocated-admin-access": {
+			// The allocated claim uses admin access, so a second claim may use
+			// the same device.
+			pod:     podWithClaimName,
+			claims:  []*resourceapi.ResourceClaim{pendingClaim, adminAccess(otherAllocatedClaim)},
+			classes: []*resourceapi.DeviceClass{deviceClass},
+			objs:    []apiruntime.Object{workerNodeSlice},
+			want: want{
+				reserve: result{
+					inFlightClaim: allocatedClaim,
+				},
+				prebind: result{
+					assumedClaim: reserve(allocatedClaim, podWithClaimName),
+					changes: change{
+						claim: func(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
+							if claim.Name == claimName {
+								claim = claim.DeepCopy()
+								claim.Finalizers = allocatedClaim.Finalizers
+								claim.Status = inUseClaim.Status
+							}
+							return claim
+						},
+					},
+				},
+				postbind: result{
+					assumedClaim: reserve(allocatedClaim, podWithClaimName),
+				},
+			},
+		},
+
 		"claim-parameters-CEL-runtime-error": {
 			pod:     podWithClaimName,
 			claims:  []*resourceapi.ResourceClaim{breakCELInClaim(pendingClaim)},
@@ -847,7 +920,7 @@ type testContext struct {
 	client           *fake.Clientset
 	informerFactory  informers.SharedInformerFactory
 	claimAssumeCache *assumecache.AssumeCache
-	p                *dynamicResources
+	p                *DynamicResources
 	nodeInfos        []*framework.NodeInfo
 	state            *framework.CycleState
 }
@@ -1014,7 +1087,7 @@ func setup(t *testing.T, nodes []*v1.Node, claims []*resourceapi.ResourceClaim, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	tc.p = pl.(*dynamicResources)
+	tc.p = pl.(*DynamicResources)
 
 	// The tests use the API to create the objects because then reactors
 	// get triggered.

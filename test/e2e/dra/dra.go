@@ -33,17 +33,21 @@ import (
 	"github.com/onsi/gomega/types"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1alpha3"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	applyv1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2edaemonset "k8s.io/kubernetes/test/e2e/framework/daemonset"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	admissionapi "k8s.io/pod-security-admission/api"
 	"k8s.io/utils/ptr"
@@ -727,12 +731,103 @@ var _ = framework.SIGDescribe("node")("DRA", feature.DynamicResourceAllocation, 
 	// TODO (https://github.com/kubernetes/kubernetes/issues/123699): move most of the test below into `testDriver` so that they get
 	// executed with different parameters.
 
+	ginkgo.Context("ResourceSlice Controller", func() {
+		// This is a stress test for creating many large slices.
+		// Each slice is as large as API limits allow.
+		//
+		// Could become a conformance test because it only depends
+		// on the apiserver.
+		f.It("creates slices", func(ctx context.Context) {
+			// Define desired resource slices.
+			driverName := f.Namespace.Name
+			numSlices := 100
+			devicePrefix := "dev-"
+			domainSuffix := ".example.com"
+			poolName := "network-attached"
+			domain := strings.Repeat("x", 63 /* TODO(pohly): add to API */ -len(domainSuffix)) + domainSuffix
+			stringValue := strings.Repeat("v", resourceapi.DeviceAttributeMaxValueLength)
+			pool := resourceslice.Pool{
+				Slices: make([]resourceslice.Slice, numSlices),
+			}
+			for i := 0; i < numSlices; i++ {
+				devices := make([]resourceapi.Device, resourceapi.ResourceSliceMaxDevices)
+				for e := 0; e < resourceapi.ResourceSliceMaxDevices; e++ {
+					device := resourceapi.Device{
+						Name: devicePrefix + strings.Repeat("x", validation.DNS1035LabelMaxLength-len(devicePrefix)-4) + fmt.Sprintf("%04d", e),
+						Basic: &resourceapi.BasicDevice{
+							Attributes: make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice),
+						},
+					}
+					for j := 0; j < resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice; j++ {
+						name := resourceapi.QualifiedName(domain + "/" + strings.Repeat("x", resourceapi.DeviceMaxIDLength-4) + fmt.Sprintf("%04d", j))
+						device.Basic.Attributes[name] = resourceapi.DeviceAttribute{
+							StringValue: &stringValue,
+						}
+					}
+					devices[e] = device
+				}
+				pool.Slices[i].Devices = devices
+			}
+			resources := &resourceslice.DriverResources{
+				Pools: map[string]resourceslice.Pool{poolName: pool},
+			}
+
+			ginkgo.By("Creating slices")
+			mutationCacheTTL := 10 * time.Second
+			controller, err := resourceslice.StartController(ctx, resourceslice.Options{
+				DriverName:       driverName,
+				KubeClient:       f.ClientSet,
+				Resources:        resources,
+				MutationCacheTTL: &mutationCacheTTL,
+			})
+			framework.ExpectNoError(err, "start controller")
+			ginkgo.DeferCleanup(func(ctx context.Context) {
+				controller.Stop()
+				err := f.ClientSet.ResourceV1alpha3().ResourceSlices().DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{
+					FieldSelector: resourceapi.ResourceSliceSelectorDriver + "=" + driverName,
+				})
+				framework.ExpectNoError(err, "delete resource slices")
+			})
+
+			// Eventually we should have all desired slices.
+			listSlices := framework.ListObjects(f.ClientSet.ResourceV1alpha3().ResourceSlices().List, metav1.ListOptions{
+				FieldSelector: resourceapi.ResourceSliceSelectorDriver + "=" + driverName,
+			})
+			gomega.Eventually(ctx, listSlices).WithTimeout(time.Minute).Should(gomega.HaveField("Items", gomega.HaveLen(numSlices)))
+
+			// Verify state.
+			expectSlices, err := listSlices(ctx)
+			framework.ExpectNoError(err)
+			gomega.Expect(expectSlices.Items).ShouldNot(gomega.BeEmpty())
+			framework.Logf("Protobuf size of one slice is %d bytes = %d KB.", expectSlices.Items[0].Size(), expectSlices.Items[0].Size()/1024)
+			gomega.Expect(expectSlices.Items[0].Size()).Should(gomega.BeNumerically(">=", 600*1024), "ResourceSlice size")
+			gomega.Expect(expectSlices.Items[0].Size()).Should(gomega.BeNumerically("<", 1024*1024), "ResourceSlice size")
+			expectStats := resourceslice.Stats{NumCreates: int64(numSlices)}
+			gomega.Expect(controller.GetStats()).Should(gomega.Equal(expectStats))
+
+			// No further changes expected now, after after checking again.
+			gomega.Consistently(ctx, controller.GetStats).WithTimeout(2 * mutationCacheTTL).Should(gomega.Equal(expectStats))
+
+			// Ask the controller to delete all slices except for one empty slice.
+			ginkgo.By("Deleting slices")
+			resources = resources.DeepCopy()
+			resources.Pools[poolName] = resourceslice.Pool{Slices: []resourceslice.Slice{{}}}
+			controller.Update(resources)
+
+			// One empty slice should remain, after removing the full ones and adding the empty one.
+			emptySlice := gomega.HaveField("Spec.Devices", gomega.BeEmpty())
+			gomega.Eventually(ctx, listSlices).WithTimeout(time.Minute).Should(gomega.HaveField("Items", gomega.ConsistOf(emptySlice)))
+			expectStats = resourceslice.Stats{NumCreates: int64(numSlices) + 1, NumDeletes: int64(numSlices)}
+			gomega.Consistently(ctx, controller.GetStats).WithTimeout(2 * mutationCacheTTL).Should(gomega.Equal(expectStats))
+		})
+	})
+
 	ginkgo.Context("cluster", func() {
 		nodes := NewNodes(f, 1, 1)
 		driver := NewDriver(f, nodes, networkResources)
 		b := newBuilder(f, driver)
 
-		ginkgo.It("support validating admission policy for admin access", func(ctx context.Context) {
+		f.It("support validating admission policy for admin access", feature.DRAAdminAccess, func(ctx context.Context) {
 			// Create VAP, after making it unique to the current test.
 			adminAccessPolicyYAML := strings.ReplaceAll(adminAccessPolicyYAML, "dra.example.com", b.f.UniqueName)
 			driver.createFromYAML(ctx, []byte(adminAccessPolicyYAML), "")
@@ -752,9 +847,9 @@ var _ = framework.SIGDescribe("node")("DRA", feature.DynamicResourceAllocation, 
 
 			// Attempt to create claim and claim template with admin access. Must fail eventually.
 			claim := b.externalClaim()
-			claim.Spec.Devices.Requests[0].AdminAccess = true
+			claim.Spec.Devices.Requests[0].AdminAccess = ptr.To(true)
 			_, claimTemplate := b.podInline()
-			claimTemplate.Spec.Spec.Devices.Requests[0].AdminAccess = true
+			claimTemplate.Spec.Spec.Devices.Requests[0].AdminAccess = ptr.To(true)
 			matchVAPError := gomega.MatchError(gomega.ContainSubstring("admin access to devices not enabled" /* in namespace " + b.f.Namespace.Name */))
 			gomega.Eventually(ctx, func(ctx context.Context) error {
 				// First delete, in case that it succeeded earlier.
@@ -843,6 +938,42 @@ var _ = framework.SIGDescribe("node")("DRA", feature.DynamicResourceAllocation, 
 			claim2.Name = "claim-1"
 			_, err = f.ClientSet.ResourceV1alpha3().ResourceClaims(f.Namespace.Name).Create(ctx, claim2, metav1.CreateOptions{})
 			gomega.Expect(err).Should(gomega.MatchError(gomega.ContainSubstring("exceeded quota: object-count, requested: count/resourceclaims.resource.k8s.io=1, used: count/resourceclaims.resource.k8s.io=1, limited: count/resourceclaims.resource.k8s.io=1")), "creating second claim not allowed")
+		})
+
+		f.It("DaemonSet with admin access", feature.DRAAdminAccess, func(ctx context.Context) {
+			pod, template := b.podInline()
+			template.Spec.Spec.Devices.Requests[0].AdminAccess = ptr.To(true)
+			// Limit the daemon set to the one node where we have the driver.
+			nodeName := nodes.NodeNames[0]
+			pod.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": nodeName}
+			pod.Spec.RestartPolicy = v1.RestartPolicyAlways
+			daemonSet := &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "monitoring-ds",
+				},
+				Spec: appsv1.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "monitoring"},
+					},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{"app": "monitoring"},
+						},
+						Spec: pod.Spec,
+					},
+				},
+			}
+
+			created := b.create(ctx, template, daemonSet)
+			if !ptr.Deref(created[0].(*resourceapi.ResourceClaimTemplate).Spec.Spec.Devices.Requests[0].AdminAccess, false) {
+				framework.Fail("AdminAccess field was cleared. This test depends on the DRAAdminAccess feature.")
+			}
+			ds := created[1].(*appsv1.DaemonSet)
+
+			gomega.Eventually(ctx, func(ctx context.Context) (bool, error) {
+				return e2edaemonset.CheckDaemonPodOnNodes(f, ds, []string{nodeName})(ctx)
+			}).WithTimeout(f.Timeouts.PodStart).Should(gomega.BeTrueBecause("DaemonSet pod should be running on node %s but isn't", nodeName))
+			framework.ExpectNoError(e2edaemonset.CheckDaemonStatus(ctx, f, daemonSet.Name))
 		})
 	})
 
@@ -1316,6 +1447,13 @@ func (b *builder) create(ctx context.Context, objs ...klog.KMetadata) []klog.KMe
 			ginkgo.DeferCleanup(func(ctx context.Context) {
 				err := b.f.ClientSet.ResourceV1alpha3().ResourceSlices().Delete(ctx, createdObj.GetName(), metav1.DeleteOptions{})
 				framework.ExpectNoError(err, "delete node resource slice")
+			})
+		case *appsv1.DaemonSet:
+			createdObj, err = b.f.ClientSet.AppsV1().DaemonSets(b.f.Namespace.Name).Create(ctx, obj, metav1.CreateOptions{})
+			// Cleanup not really needed, but speeds up namespace shutdown.
+			ginkgo.DeferCleanup(func(ctx context.Context) {
+				err := b.f.ClientSet.AppsV1().DaemonSets(b.f.Namespace.Name).Delete(ctx, obj.Name, metav1.DeleteOptions{})
+				framework.ExpectNoError(err, "delete daemonset")
 			})
 		default:
 			framework.Fail(fmt.Sprintf("internal error, unsupported type %T", obj), 1)
